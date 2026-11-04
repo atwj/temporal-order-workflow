@@ -32,7 +32,7 @@ async def env():
         yield env
 
 
-def mock(name, returns=None, fail=False, flaky=False):
+def mock(name, returns=None, fail=False, flaky=False, fail_times=2):
     """A fake activity with the real one's name, recording that it ran."""
 
     @activity.defn(name=name)
@@ -40,7 +40,7 @@ def mock(name, returns=None, fail=False, flaky=False):
         calls.append(name)
         if fail:
             raise ApplicationError(f"{name} failed", non_retryable=True)
-        if flaky and activity.info().attempt < 3:
+        if flaky and activity.info().attempt <= fail_times:
             raise RuntimeError("timeout")
         return returns
 
@@ -98,6 +98,16 @@ async def test_flaky_gateway_is_retried_until_it_works(env):
     _, result = await run(env, mocks(authorize_payment=mock("authorize_payment", "auth-1", flaky=True)))
     assert result == "track-1"
     assert calls.count("authorize_payment") == 3
+
+
+async def test_transient_failures_retry_until_the_outcome_is_known(env):
+    # 7 timeouts in a row: there is no attempt cap, so the order still completes
+    # instead of undoing a step whose outcome is unknown.
+    flaky = mock("capture_payment", "charge-1", flaky=True, fail_times=7)
+    _, result = await run(env, mocks(capture_payment=flaky))
+    assert result == "track-1"
+    assert calls.count("capture_payment") == 8
+    assert "void_authorization" not in calls
 
 
 async def test_business_failure_is_not_retried(env):

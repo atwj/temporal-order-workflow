@@ -25,12 +25,15 @@ with workflow.unsafe.imports_passed_through():
     )
     from shared import Notification, Order
 
-# Forward steps: retry transient errors with backoff, then give up.
+# Forward steps: retry transient errors (timeouts, 5xx) with backoff until the
+# outcome is known. No attempt cap: if a step gave up after N timeouts, the
+# side effect might still have happened (a charge that went through, stock that
+# was reserved), and the undo would run against the wrong state.
+# Business failures (non_retryable=True) still stop at once and trigger the undo.
 STEP_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
     backoff_coefficient=2.0,
-    maximum_interval=timedelta(seconds=10),
-    maximum_attempts=5,
+    maximum_interval=timedelta(seconds=30),
 )
 # Undo steps: no attempt cap. An undo must happen eventually.
 UNDO_RETRY = RetryPolicy(maximum_interval=timedelta(seconds=30))
@@ -81,7 +84,8 @@ class OrderWorkflow:
                 )
             self.status = "FAILED"
             await self.notify(order, "Sorry, we could not complete your order.")
-            raise ApplicationError(f"Order failed: {err.cause}", non_retryable=True)
+            reason = err.cause.message if isinstance(err.cause, ApplicationError) else str(err.cause)
+            raise ApplicationError(f"Order failed: {reason}", non_retryable=True)
 
         self.status = "COMPLETED"
         await self.notify(order, f"Your order has shipped. Tracking: {tracking_id}")

@@ -5,6 +5,7 @@ Run: python worker.py
 """
 
 import asyncio
+import logging
 
 from temporalio.client import Client
 from temporalio.worker import Worker
@@ -24,6 +25,11 @@ from workflow import OrderWorkflow
 
 
 async def main() -> None:
+    logging.basicConfig(level=logging.WARNING)
+    # The SDK logs a full stack trace for every failed activity attempt. Expected
+    # business failures (card declined, out of stock) would flood the demo log;
+    # the activities already print one clear line each.
+    logging.getLogger("temporalio.activity").setLevel(logging.ERROR)
     client = await Client.connect("localhost:7233")
     worker = Worker(
         client,

@@ -11,7 +11,7 @@ The sections below cover:
   to show durable execution at work.
 - **Design, and before and after Temporal:** the order's architecture with and without Temporal.
 - **Who benefits:** what Temporal offers each persona involved.
-- **How I approached this** and **Possible enhancements:** my reasoning, and what I left out.
+- **How I approached this** and **Known limitations and next steps:** my reasoning, and what I left out.
 
 ## Installation
 
@@ -66,13 +66,8 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-`requirements.txt`:
-
-```text
-temporalio        # Temporal Python SDK
-pytest            # tests
-pytest-asyncio    # async tests
-```
+`requirements.txt` pins exact versions. The top-level packages are `temporalio` (the Temporal
+Python SDK), `pytest` and `pytest-asyncio` (for the tests).
 
 ## Run it
 
@@ -90,26 +85,17 @@ Run the tests (no server needed, pytest starts its own):
 pytest -v
 ```
 
-### Troubleshooting
-
-| Error | Fix |
-| --- | --- |
-| `Connection refused` on `localhost:7233` | The Temporal server is not running: start it in terminal 1 |
-| `ModuleNotFoundError: No module named 'temporalio'` | The virtual environment is not active: `source .venv/bin/activate` |
-| `client.py` waits and nothing happens | The worker is not running: start `python worker.py` in terminal 2 |
-| `WorkflowAlreadyStartedError` | That order ID was already used: pick a new one, such as `python client.py 8` |
-
 ## Demo scenarios
 
 | # | Scenario | Command | What you should see |
 | --- | --- | --- | --- |
 | 1 | Happy path | `python client.py 1` | `COMPLETED, tracking track-1`, with all 4 steps and an email in the worker log |
 | 2 | Flaky gateway | `python client.py 2 gateway_flaky` | Authorize attempts 1 and 2 fail, attempt 3 succeeds, then COMPLETED |
-| 3 | Card declined | `python client.py 3 card_declined` | 1 attempt only, no undo, `FAILED: Card declined` |
+| 3 | Card declined | `python client.py 3 card_declined` | 1 attempt only, no undo, `FAILED: Order failed: Card declined` |
 | 4 | Out of stock | `python client.py 4 out_of_stock` | `voided auth-4`, then FAILED |
 | 5 | Bad address | `python client.py 5 bad_address` | `refunded charge-5`, then `released res-5`, then FAILED |
-| 6 | Worker crash | `python client.py 6 slow_inventory`, kill the worker during the 10 s wait (`pkill -9 -f worker.py`), restart it | Reserve retries within about 15 s and the order completes. Authorize is not re-run. |
-| 7 | Duplicate order | `python client.py 1` again | `WorkflowAlreadyStartedError`: the same order cannot run twice |
+| 6 | Worker crash | `python client.py 6 slow_inventory`, kill the worker during the 10 s wait (`pkill -9 -f worker.py`), restart it | Reserve is retried after its 15 s timeout, and the order completes about 25 s after the kill. Authorize is not re-run. |
+| 7 | Duplicate order | `python client.py 1` again | `Not started: order-1 already exists`: the same order cannot run twice |
 
 While order 6 runs, check its status:
 
@@ -158,7 +144,7 @@ two cron jobs. That resiliency logic is spread across services and is most of th
 
 ![Durable execution with Temporal](diagrams/4-durable-execution.svg)
 
-With Temporal, the order is one workflow function. The red components move into the platform:
+With Temporal, the order is one workflow function. 6 of the 8 red components move into the platform:
 
 | Hand-built (diagram 3) | With Temporal | In the code |
 | --- | --- | --- |
@@ -169,20 +155,30 @@ With Temporal, the order is one workflow function. The red components move into 
 | Compensation handlers | One list in one place, run newest first | `compensations` |
 | Stuck-order cron | Per-attempt timeout, then a retry on any worker | `STEP_TIMEOUT` |
 
-Temporal does not replace idempotency at Stripe. Each payment call should send an idempotency
-key per step, such as `{order_id}-auth` or `{order_id}-capture`, so a retried call never
-creates a duplicate payment.
+The other 2 stay outside the platform:
+
+- **Idempotency keys stay yours.** Temporal does not replace idempotency at Stripe. Each payment
+  call should send an idempotency key per step, such as `{order_id}-auth` or `{order_id}-capture`,
+  so a retried call never creates a duplicate payment.
+- **Reconciliation becomes a Schedule** (see Known limitations and next steps). It stays as a safety check,
+  not as the way failed orders are recovered.
+
+**Why forward steps retry with no attempt cap:** if a step gave up after N timeouts, its side
+effect might still have happened, for example a capture that went through but whose response was
+lost. The undo would then run against the wrong state (voiding an authorization that was already
+captured). So transient errors retry until the outcome is known, and only business failures stop
+a step and trigger the undo.
 
 ## Who benefits, and how
 
 | Persona | Pain today | What's in it for them | Where this repo shows it |
 | --- | --- | --- | --- |
-| CTO / VP Engineering | Checkout is the revenue path, and its resiliency code costs more to build and run than the features | Teams ship business logic instead of plumbing; one platform for orders, refunds and payouts | Diagram 3 vs diagram 4: about 8 hand-built components move into the platform |
+| CTO / VP Engineering | Checkout is the revenue path, and its resiliency code costs more to build and run than the features | Teams ship business logic instead of plumbing; one platform for orders, refunds and payouts | Diagram 3 vs diagram 4: 6 of 8 hand-built components move into the platform |
 | Developers | Retry loops, status tables and undo handlers in every service; failure paths are hard to test | The order is one readable function; retries and timeouts are config; time-skipping tests run in seconds | `workflow.py`, `tests/test_workflow.py` |
 | SRE / on-call | Paged for stuck orders, DLQs to drain, risky restarts | Kill or redeploy workers at any time; every order's history is in the Web UI | Demo scenario 6 (worker crash) |
 | Payments and finance ops | Double charges, card holds left behind, reconciliation finds problems the next day | Every completed step is undone on failure; an order ID cannot run twice | Failure table under diagram 1, `REJECT_DUPLICATE` |
 | Customer support | "Where is my order?" means asking engineering | The current step is one query away | `get_status` |
-| Product manager | Adding a step (fraud check, cancel window, delivery wait) is a multi-team project | A new step is a new activity call or signal in one function | Possible enhancements |
+| Product manager | Adding a step (fraud check, cancel window, delivery wait) is a multi-team project | A new step is a new activity call or signal in one function | Known limitations and next steps |
 
 ## How I approached this
 - **Why this use case:** I work with many e-commerce businesses that integrate Stripe.
@@ -191,16 +187,24 @@ creates a duplicate payment.
 - **Made failures easy to show:** a small command-line client (`client.py`) triggers each scenario
   (failed payment, flaky gateway, no inventory, bad address, worker crash). It also let me
   build and test the workflow one step at a time.
-- **Considered but kept out:** see Possible enhancements. Worth knowing, but not needed
+- **Considered but kept out:** see Known limitations and next steps. Worth knowing, but not needed
   to show the core idea.
 
-## Possible enhancements
+## Known limitations and next steps
 
-| Enhancement | Why | Temporal docs |
-| --- | --- | --- |
-| Heartbeats on slow activities | Notice a dead worker in seconds, not after the 15 s timeout | [Activity heartbeats and timeouts](https://docs.temporal.io/develop/python/activities/timeouts), [Detecting activity failures](https://docs.temporal.io/encyclopedia/detecting-activity-failures) |
-| Signals for delivery confirmation and a dispute window | Human in the loop: wait for the carrier or the buyer, with a durable timer | [Signals, Queries and Updates](https://docs.temporal.io/develop/python/workflows/message-passing) |
-| An Update with a validator to cancel before shipping | The customer gets an immediate accept or reject | [Update handlers and validators](https://docs.temporal.io/develop/python/workflows/message-passing) |
-| Idempotency keys sent to the payment gateway | A retried capture must never charge twice | [Activity idempotency](https://docs.temporal.io/activity-definition#idempotency) |
-| A Schedule for daily reconciliation | Replaces a cron job; durable, pausable, visible in the UI | [Schedules](https://docs.temporal.io/develop/python/workflows/schedules) |
-| Workflow versioning | Deploy code changes safely while orders are still running | [Versioning and patching](https://docs.temporal.io/develop/python/workflows/versioning) |
+The goal was to show the core idea. So these are some of deliberate gaps,
+each with the Temporal feature that should close it.
+
+| Gap today | Why it matters | Next step | Temporal docs |
+| --- | --- | --- | --- |
+| Forward steps retry until the outcome is known | A long Stripe outage leaves an order waiting, not failed | `schedule_to_close_timeout` plus an alert | [Activity timeouts](https://docs.temporal.io/develop/python/activities/timeouts) |
+| An undo that can never succeed retries forever | A rejected refund leaves the order in COMPENSATING with no alert | Alert after N attempts, then hand over to a person with a signal | [Signals, Queries and Updates](https://docs.temporal.io/develop/python/workflows/message-passing) |
+| Mocks send no idempotency keys | A retried capture or refund could run twice at a real gateway | Send a key per step and per undo, such as `{order_id}-capture` and `{order_id}-refund` | [Activity idempotency](https://docs.temporal.io/activity-definition#idempotency) |
+| 15 s timeout, no heartbeats | A slow but healthy call is retried while still running; a dead worker takes 15 s to notice | Per-service timeouts and heartbeats on long calls | [Detecting activity failures](https://docs.temporal.io/encyclopedia/detecting-activity-failures) |
+| Customer email stored in plain text in the event history | Visible to anyone with Web UI access | Encrypt payloads with a payload codec and codec server | [Payload encryption](https://docs.temporal.io/develop/python/data-handling/data-encryption) |
+
+Also next: customer cancel with an Update, delivery and dispute signals with a durable timer,
+a reconciliation Schedule, workflow versioning, and a Temporal Cloud connection.
+
+A failed order's ID cannot be reused (`REJECT_DUPLICATE`). That is deliberate: it prevents a
+double charge, and the customer places a new order instead.
