@@ -1,1 +1,11 @@
-temporalio>=1.8
+iniconfig==2.3.1
+nexus-rpc==1.4.0
+packaging==26.3
+pluggy==1.7.0
+protobuf==7.36.2
+Pygments==2.21.0
+pytest==9.2.0
+pytest-asyncio==1.4.1.post1
+temporalio==1.35.0
+types-protobuf==7.35.1.20260906
+typing_extensions==4.16.0
