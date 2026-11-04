@@ -10,20 +10,20 @@ with a saga that undoes completed steps if a later one fails.
 pip install -r requirements.txt
 temporal server start-dev     # terminal 1, Web UI http://localhost:8233
 python worker.py              # terminal 2
-python starter.py 1           # terminal 3
+python client.py 1           # terminal 3
 ```
 
 ## Demo scenarios
 
 | # | Scenario | Command | What you should see |
 | --- | --- | --- | --- |
-| 1 | Happy path | `python starter.py 1` | `COMPLETED, tracking track-1`, with all 4 steps and an email in the worker log |
-| 2 | Flaky gateway | `python starter.py 2 gateway_flaky` | Authorize attempts 1 and 2 fail, attempt 3 succeeds, then COMPLETED |
-| 3 | Card declined | `python starter.py 3 card_declined` | 1 attempt only, no undo, `FAILED: Card declined` |
-| 4 | Out of stock | `python starter.py 4 out_of_stock` | `voided auth-4`, then FAILED |
-| 5 | Bad address | `python starter.py 5 bad_address` | `refunded charge-5`, then `released res-5`, then FAILED |
-| 6 | Worker crash | `python starter.py 6 slow_inventory`, kill the worker during the 10 s wait (`pkill -9 -f worker.py`), restart it | Reserve retries within about 15 s and the order completes. Authorize is not re-run. |
-| 7 | Duplicate order | `python starter.py 1` again | `WorkflowAlreadyStartedError`: the same order cannot run twice |
+| 1 | Happy path | `python client.py 1` | `COMPLETED, tracking track-1`, with all 4 steps and an email in the worker log |
+| 2 | Flaky gateway | `python client.py 2 gateway_flaky` | Authorize attempts 1 and 2 fail, attempt 3 succeeds, then COMPLETED |
+| 3 | Card declined | `python client.py 3 card_declined` | 1 attempt only, no undo, `FAILED: Card declined` |
+| 4 | Out of stock | `python client.py 4 out_of_stock` | `voided auth-4`, then FAILED |
+| 5 | Bad address | `python client.py 5 bad_address` | `refunded charge-5`, then `released res-5`, then FAILED |
+| 6 | Worker crash | `python client.py 6 slow_inventory`, kill the worker during the 10 s wait (`pkill -9 -f worker.py`), restart it | Reserve retries within about 15 s and the order completes. Authorize is not re-run. |
+| 7 | Duplicate order | `python client.py 1` again | `WorkflowAlreadyStartedError`: the same order cannot run twice |
 
 While order 6 runs, check its status:
 `temporal workflow query --workflow-id order-6 --name get_status`
