@@ -121,15 +121,7 @@ temporal workflow query --workflow-id order-6 --name get_status
 
 ### 1. Business process
 
-```mermaid
-flowchart LR
-  start((Place order)) --> A[Authorize payment] --> R[Reserve inventory] --> C[Capture payment] --> S[Ship order] --> N[Notify customer]
-  A -. undo .-> VA[Void authorization]
-  R -. undo .-> RI[Release inventory]
-  C -. undo .-> RF[Refund payment]
-  classDef undo fill:#ffc9c9,stroke:#c92a2a
-  class VA,RI,RF undo
-```
+![Business process: each step and its undo](diagrams/1-business-process.svg)
 
 If a step fails, every completed step is undone, newest first:
 
@@ -148,18 +140,7 @@ Transient failures (a gateway timeout) are retried with backoff. Business failur
 
 ### 2. External services: the happy path
 
-```mermaid
-flowchart LR
-  subgraph OS[Order service]
-    A[Authorize] --> R[Reserve] --> C[Capture] --> S[Ship] --> N[Notify]
-  end
-  A --> STRIPE{{Stripe: payments}}
-  C --> STRIPE
-  R --> INV{{Inventory service}}
-  S --> CAR{{Carrier API: EasyPost or Shippo}}
-  N --> MAIL{{Email: SendGrid or Amazon SES}}
-  OS --> DB[(Orders database)]
-```
+![External services on the happy path](diagrams/2-external-services.svg)
 
 On the happy path, the order calls 4 external systems: Stripe for payments, an inventory
 service, a carrier API and an email provider. Every one of these calls can time out,
@@ -167,28 +148,7 @@ return an error or rate-limit.
 
 ### 3. Making it resilient by hand
 
-```mermaid
-flowchart LR
-  SWEEP[Cron: stuck-order sweeper]:::res -->|poll| STATE[(Order status table)]:::res
-  RECON[Cron: nightly reconciliation]:::res -->|compare with Stripe| STATE
-  IDEM[(Idempotency key store)]:::res
-  STATE --- OS
-  IDEM --- OS
-  subgraph OS[Order service]
-    direction TB
-    A[Authorize] --> R[Reserve] --> C[Capture] --> S[Ship] --> N[Notify]
-  end
-  A --> R1[retries]:::res --> STRIPE{{Stripe}}:::biz
-  C --> R3[retries]:::res --> STRIPE
-  R --> R2[retries]:::res --> INV{{Inventory service}}:::biz
-  S --> Q1[[queue]]:::res --> CAR{{Carrier API}}:::biz
-  N --> Q2[[queue]]:::res --> MAIL{{Email}}:::biz
-  Q1 -->|failed after retries| DLQ[[Dead-letter queue]]:::res --> COMP[Compensation handlers: void, release, refund]:::res
-  classDef res fill:#ffc9c9,stroke:#c92a2a
-  classDef biz fill:#b2f2bb,stroke:#2b8a3e
-```
-
-Red = resiliency logic you build and run. Green = the external services the business logic calls.
+![Resiliency logic built by hand around the order service](diagrams/3-hand-built-resiliency.svg)
 
 Without Temporal, the 5 business steps need about 8 extra components to survive failures:
 retries, queues, a DLQ, compensation handlers, a status table, an idempotency store and
@@ -196,34 +156,7 @@ two cron jobs. That resiliency logic is spread across services and is most of th
 
 ### 4. Durable execution with Temporal
 
-```mermaid
-flowchart LR
-  subgraph ENV[Your environment]
-    subgraph APP[Worker: worker.py]
-      W[OrderWorkflow: Authorize, Reserve, Capture, Ship, Notify, compensations]
-      SDK[Temporal Python SDK]
-    end
-  end
-  subgraph TP[Temporal platform: Cloud or self-hosted]
-    SM[State management: event history]
-    RT[Retries]
-    TQ[Task queue 'orders']
-    DT[Durable timers]
-    CS[Cron / Schedules]
-    HL[Human in the loop]
-  end
-  SDK -->|polls tasks, reports results| TP
-  W --> STRIPE{{Stripe}}
-  W --> INV{{Inventory}}
-  W --> CAR{{Carrier}}
-  W --> MAIL{{Email}}
-  classDef used fill:#b2f2bb,stroke:#2b8a3e
-  classDef later fill:#e9ecef,stroke:#868e96,stroke-dasharray: 4 4
-  class SM,RT,TQ used
-  class DT,CS,HL later
-```
-
-Green = platform features this solution uses. Grey dashed = possible enhancements.
+![Durable execution with Temporal](diagrams/4-durable-execution.svg)
 
 With Temporal, the order is one workflow function. The red components move into the platform:
 
