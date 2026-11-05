@@ -1,14 +1,20 @@
 # Order workflow on Temporal
 
-A durable e-commerce order in Python on Temporal: **authorize → reserve → capture → ship → notify**.
+## About
 
-If a step fails, or the customer cancels before shipping, every step that **started** is undone
-(newest first). If an undo cannot succeed, the order waits for a person (`NEEDS_ATTENTION`).
+This repo models a simple e-commerce order as one durable process:
 
-**Why Temporal:** retries, timeouts, cancellation, compensation, and an ops handoff live in one
-workflow function instead of a hand-built state machine of queues, cron jobs, and status tables.
+**authorize payment → reserve stock → capture payment → ship → email the customer.**
 
-**Prove it in three terminals** (after [Installation](#installation)):
+If something goes wrong—or the customer cancels before shipping—completed work is undone in
+reverse order (for example: refund, then release stock). If an undo itself gets stuck (Stripe
+refuses a refund), the order waits for a person to decide what to do next.
+
+The point of the demo is to show how Temporal keeps that whole story in one place: retries,
+timeouts, cancellation, cleanup, and a handoff to ops—without building a maze of queues, cron
+jobs, and status tables yourself.
+
+To try the happy path after [Setup](#setup):
 
 ```bash
 temporal server start-dev          # terminal 1 — UI at http://localhost:8233
@@ -16,13 +22,11 @@ python worker.py                   # terminal 2
 python client.py 1                 # terminal 3 → COMPLETED, tracking track-1
 ```
 
-Then try a failure (`python client.py 3 card_declined`) or a cancel (scenario 8 below).
+## Setup
 
-## Installation
+You need Python **3.12+**, the Temporal CLI, and the packages in `requirements.txt`.
 
-Python **3.12+**. You need the Temporal CLI, a venv, and the pinned packages.
-
-### 1. Install the Temporal CLI
+### Install the Temporal CLI
 
 | OS | Command |
 | --- | --- |
@@ -34,200 +38,177 @@ Python **3.12+**. You need the Temporal CLI, a venv, and the pinned packages.
 temporal --version
 ```
 
-### 2. Start the local Temporal server
+### Start Temporal and the app
 
 ```bash
+# terminal 1 — local server (Web UI: http://localhost:8233)
 temporal server start-dev
-```
 
-Server: `localhost:7233`. Web UI: http://localhost:8233.  
-Data is in-memory unless you pass `--db-filename temporal.db`.
-
-### 3. Python environment
-
-```bash
+# from the repo root — Python env (once)
 python3.12 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+
+# terminal 2
+python worker.py
+
+# terminal 3
+python client.py 1
 ```
 
-Activate the venv in every terminal you use for the worker, client, or tests.
-
-## Run it
-
-| Terminal | Command | Role |
-| --- | --- | --- |
-| 1 | `temporal server start-dev` | Server + Web UI |
-| 2 | `python worker.py` | Workflow + activity worker |
-| 3 | `python client.py 1` | Place order 1 |
+Activate the venv in every terminal you use. To keep workflow history across server restarts:
 
 ```bash
-pytest -v   # no server needed; 29 tests
+temporal server start-dev --db-filename temporal.db
 ```
 
-### Client cheat sheet
+Tests (no server needed):
 
 ```bash
-python client.py ORDER_ID [SIMULATE]           # place order
-python client.py cancel ORDER_ID               # customer cancel (Update)
-python client.py status ORDER_ID               # query current step
-python client.py resolve ORDER_ID retry|done_manually   # ops handoff
+pytest -v
 ```
 
-`SIMULATE`: `card_declined` · `gateway_flaky` · `out_of_stock` · `slow_inventory` · `bad_address` · `refund_rejected`
-
-## Demo scenarios
-
-Use a **new order ID** for each run (reuse is rejected on purpose).
-
-| # | Scenario | Command | Expect |
-| --- | --- | --- | --- |
-| 1 | Happy path | `python client.py 1` | `COMPLETED, tracking track-1` |
-| 2 | Flaky gateway | `python client.py 2 gateway_flaky` | Authorize retries twice (stack traces), then COMPLETED |
-| 3 | Card declined | `python client.py 3 card_declined` | Void finds nothing; `FAILED: Card declined` |
-| 4 | Out of stock | `python client.py 4 out_of_stock` | Release no-op, then void auth; FAILED |
-| 5 | Bad address | `python client.py 5 bad_address` | Refund, then release; FAILED |
-| 6 | Worker crash | `python client.py 6 slow_inventory`, then `pkill -9 -f worker.py`, restart worker | Reserve retries after ~5 s; authorize **not** re-run; COMPLETED ~15 s after kill |
-| 7 | Duplicate order | `python client.py 1` again | `Not started: order-1 already exists` |
-| 8 | Customer cancel | `python client.py 8 slow_inventory`, then `python client.py cancel 8` | Reserve **stopped**; void auth; `CANCELLED` |
-| 9 | Operator cancel | Same as 8, but `temporal workflow cancel --workflow-id order-9` | Same cleanup; Web UI status **Canceled** |
-| 10 | Cancel too late | `python client.py cancel 1` | `Rejected: workflow execution already completed`. Mid-ship: `Too late to cancel` |
-| 11 | Refund refused | `python client.py 11 refund_rejected`, then `status 11`, then `resolve 11 done_manually` | `NEEDS_ATTENTION` → after resolve, release runs → FAILED |
-
-While order 6 runs:
+### Client commands
 
 ```bash
-python client.py status 6
-# or: temporal workflow query --workflow-id order-6 --name get_status
+python client.py ORDER_ID [SIMULATE]                    # place an order
+python client.py cancel ORDER_ID                        # customer cancel
+python client.py status ORDER_ID                        # where is this order?
+python client.py resolve ORDER_ID retry|done_manually   # ops: unstick a failed undo
 ```
 
-Worker log lines look like `[order-4 void_authorization attempt 1]` (`activity.logger`).
+Use a **new order ID** each time—the same ID cannot run twice on purpose.
 
-### Expected worker highlights
+`SIMULATE` options: `card_declined`, `gateway_flaky`, `out_of_stock`, `slow_inventory`,
+`bad_address`, `refund_rejected`.
 
-- **3:** `no hold to void for order 3`
-- **4:** `no reservation to release for order 4`, then `voided auth-4`
-- **8/9:** warehouse “slow” line, **no** `reserved` line, then void
-- **10 (shipping):** `Cancel ignored: the order has already shipped`
-- **11:** `ERROR` … `refund_payment failed`, later `released res-11`
-
-## How the saga works
+## How the saga is designed
 
 ![Business process: each step and its undo](diagrams/1-business-process.svg)
 
-*Happy path and undo order. Cancel before shipping and the ops handoff for stuck undos are in the rules below.*
+The order is a **saga**: each step has a matching undo. If a later step fails, earlier steps are
+rolled back, newest first.
 
-| Step that fails | Undo (newest first) | Ends as |
+| If this fails… | We undo… | Order ends as |
 | --- | --- | --- |
-| Authorize | Void | FAILED |
-| Reserve | Release → void | FAILED |
-| Capture | Refund → release → void | FAILED |
-| Ship | Refund → release | FAILED |
-| Notify | — (best-effort) | COMPLETED |
-| Cancel before shipping | Same undos as failure at the current step | CANCELLED |
+| Authorize | Void the card hold | FAILED |
+| Reserve stock | Release stock, void hold | FAILED |
+| Capture payment | Refund, release stock, void hold | FAILED |
+| Ship | Refund, release stock | FAILED |
+| Email | Nothing (email is best-effort) | COMPLETED |
+| Cancel before shipping | Same undos as a failure at the current step | CANCELLED |
 
-### Rules (rule → why → where)
+Design choices, in plain language:
 
-| Rule | Why | Where |
-| --- | --- | --- |
-| **Undo before each step** | Side effect can land even if the ACK never returns | `compensations.append` before `step()` |
-| **Idempotent activities** | Temporal runs activities at least once | Keys `{order_id}-{step}` · `fake_services.py` |
-| **Heartbeats on every call** | Dead worker in ~5 s; cancel delivery | `call_service()` · `HEARTBEAT_TIMEOUT` |
-| **Customer cancel races the step** | Don’t wait out a slow warehouse after “cancel” | `start_activity` + `wait_condition` + `handle.cancel()` |
-| **Wait for activity stop, then undo** | Avoid undo racing a still-running side effect | `WAIT_CANCELLATION_COMPLETED` |
-| **Check cancel between steps** | Late success must not continue the saga | `check_cancel()` · `cancellation_reason()` |
-| **Too late once shipping** | Parcel is with the carrier | Validator rejects customer cancel; operator cancel logged ignored |
-| **Cancel never stops an undo** | Cleanup must finish | `asyncio.shield` in `finish()` / `run_undo()` |
-| **Stuck undo → person** | Don’t retry a refused refund forever | `NEEDS_ATTENTION` · `resolve_undo` |
-| **Bounded forward retries** | Outages must not hang forever | `STEP_DEADLINE` (2 min `schedule_to_close`) |
-| **Business vs transient errors** | Declines aren’t timeouts | `non_retryable` + `BENIGN` vs plain exceptions |
-
-**Customer cancel** is an Update (`OrderWorkflow.cancel`) with an immediate accept/reject.  
-**Operator cancel** is `temporal workflow cancel` (workflow ends **Canceled**).  
-Both stop the running step before shipping; undos then run.
+- **Remember the undo before doing the step.** A payment or reservation can succeed in the real
+  world even if our app never hears the reply. The undo has to be ready either way, and safe to
+  run when there was nothing to undo.
+- **Assume steps may run more than once.** Timeouts and retries are normal. Every call to Stripe
+  (and the stand-in services here) uses an idempotency key so a repeat does not double-charge.
+- **Keep long work “alive” with heartbeats.** That is how the system notices a dead worker quickly
+  and how a cancel reaches work that is still running.
+- **Cancel stops the current step (before shipping), then undoes.** The customer gets an immediate
+  yes/no. An operator can cancel from the Temporal CLI. Once shipping has started, it is too late;
+  the parcel is with the carrier.
+- **Cleanup is not cancelled.** If someone cancels while we are refunding or releasing stock, we
+  still finish putting things back.
+- **Stuck undos wait for a person.** A refused refund does not retry forever. The order moves to
+  `NEEDS_ATTENTION` until ops says `retry` or `done_manually`.
+- **Retries are bounded.** A flaky gateway is retried with backoff, but each step has an overall
+  time limit so an outage cannot hang an order forever. Clear business failures (card declined,
+  out of stock) stop immediately and trigger undo.
 
 ## Before and after Temporal
 
-### External services (happy path)
+### The systems we call
 
 ![External services on the happy path](diagrams/2-external-services.svg)
 
-Four systems: Stripe, inventory, carrier, email — each can time out, error, or rate-limit.
+On the happy path the order talks to four outside systems: payments (Stripe), inventory, the
+carrier, and email. Any of them can time out, error, or rate-limit.
 
-### Resiliency by hand
+### Building resiliency by hand
 
 ![Resiliency logic built by hand around the order service](diagrams/3-hand-built-resiliency.svg)
 
-Without Temporal, those five business steps need roughly eight extra components (retries, queues,
-DLQ, compensation, status table, idempotency store, stuck-order cron, …). Most of the code is
-plumbing.
+Without something like Temporal, those few business steps usually grow a pile of extra machinery:
+retry wrappers, queues, dead-letter queues, compensation handlers, a status table, an idempotency
+store, stuck-order cron jobs, and more. Most of the code becomes plumbing, spread across services.
 
-### Durable execution
+### With durable execution
 
 ![Durable execution with Temporal](diagrams/4-durable-execution.svg)
 
-Six of those eight move into the platform:
+With Temporal, the order is one workflow. Most of that plumbing moves into the platform:
 
-| Hand-built | With Temporal | In the code |
-| --- | --- | --- |
-| Status table | Event history + query | `get_status` |
-| Retry wrappers | Server-side retry policy | `STEP_RETRY`, `UNDO_RETRY` |
-| Queues | Task queue | `TASK_QUEUE = "orders"` |
-| DLQ | Non-retryable → undo; stuck undo → ops | `NEEDS_ATTENTION`, `resolve_undo` |
-| Compensation handlers | One list, newest first | `compensations` |
-| Stuck-order cron | Heartbeats, timeouts, step deadline | `HEARTBEAT_TIMEOUT`, `STEP_TIMEOUT`, `STEP_DEADLINE` |
+| You used to build… | Temporal covers… |
+| --- | --- |
+| Status table | History of every step, plus a simple status query |
+| Retry / backoff code | Retry policies on each step |
+| Queues to other systems | A task queue that workers poll |
+| Dead-letter / stuck-order handling | Failed business steps trigger undo; a stuck undo waits for ops |
+| Compensation scattered in services | One undo list in the workflow |
+| “Is this worker dead?” cron | Heartbeats and timeouts, then retry on another worker |
 
-Still yours:
+Two things stay yours:
 
-- **Idempotency keys** at the gateway (`activities.py` / `fake_services.py`)
-- **Reconciliation** as a Schedule (safety net — see Known limitations)
+- **Idempotency keys** at the payment (and other) APIs—Temporal runs steps at least once; it does
+  not replace Stripe’s idempotency.
+- **Reconciliation** as a safety net (see Future enhancements)—not as the main way failed orders
+  are recovered.
 
-Giving up after `STEP_DEADLINE` is safe here because the undo was registered first and is
-idempotent (e.g. refund only if a charge exists).
+## Scenarios
+
+Run these with the worker and Temporal server up. Prefer a fresh order ID for each row.
+
+| # | What you are showing | How to run it | What you should see |
+| --- | --- | --- | --- |
+| 1 | Happy path | `python client.py 1` | `COMPLETED, tracking track-1` |
+| 2 | Transient payment glitch | `python client.py 2 gateway_flaky` | Authorize fails twice, then succeeds; order completes |
+| 3 | Card declined | `python client.py 3 card_declined` | Fails immediately; void finds nothing to undo |
+| 4 | Out of stock | `python client.py 4 out_of_stock` | Hold is voided; order FAILED |
+| 5 | Bad shipping address | `python client.py 5 bad_address` | Payment refunded, stock released; FAILED |
+| 6 | Worker dies mid-order | `python client.py 6 slow_inventory`, kill the worker during the wait (`pkill -9 -f worker.py`), restart it | Reserve is retried; authorize is **not** done again; order still completes |
+| 7 | Same order twice | `python client.py 1` again | Refused: that order ID already exists |
+| 8 | Customer cancels in time | `python client.py 8 slow_inventory`, then quickly `python client.py cancel 8` | Cancel accepted; stock not left reserved; `CANCELLED` |
+| 9 | Operator cancels | Same timing as 8, with `temporal workflow cancel --workflow-id order-9` | Same cleanup; UI shows **Canceled** |
+| 10 | Cancel too late | `python client.py cancel 1` (after it finished), or cancel while shipping | Rejected, or ignored once shipping has started |
+| 11 | Refund needs a human | `python client.py 11 refund_rejected`, then `status 11`, then `resolve 11 done_manually` | Ship fails (**Bad address**), then the refund is refused and the order waits. After resolve, stock is released; the client still ends with `FAILED: … Bad address` (the original ship problem) |
+
+**Timing tip for 6, 8, and 9:** cancel or kill the worker while the log still says the warehouse is
+slow—before you see `reserved`.
+
+Check progress anytime with `python client.py status ORDER_ID`.
 
 ## Who benefits
 
-| Persona | Pain | What this shows |
+| Persona | Pain today | What this demo shows |
 | --- | --- | --- |
-| CTO / VP Eng | Checkout resiliency costs more than features | Diagram 3 vs 4 |
-| Developers | Retry/undo logic in every service | `workflow.py`, time-skipping tests |
-| SRE / on-call | Stuck orders, risky restarts | Scenarios **6** and **11** |
-| Payments / finance | Double charges, orphaned holds | Failure table, idempotency keys, scenario **11** |
-| Support | “Where is my order?” / “cancel it” | `status`, `cancel`, scenarios **8–10** |
-| Product | New step = multi-team project | One new activity or signal in the workflow |
+| **Engineering leaders** | Checkout resiliency costs more to build and run than the product features | Most of the failure machinery moves into the platform (diagrams 3 vs 4) |
+| **Developers** | Retries, status, and undo logic copied through every service | The order is one readable flow; failures are demos and tests, not folklore |
+| **Support & ops** | “Where is my order?” and stuck refunds mean paging engineering | Status and cancel are simple commands; a refused refund waits for a person (scenarios 8–11) |
 
-## How I approached this
+## Approach
 
-- **Use case:** after Stripe accepts a payment — holds, inventory, shipping, and refunds when
-  something breaks.
-- **Demos first:** `client.py` scenarios made each failure path easy to build and show.
-- **Left out on purpose:** see Known limitations (enough for the core idea, not a full platform).
+- **Start from the business:** after a payment is accepted—holds, inventory, shipping, and what
+  happens when something breaks.
+- **Make failures easy to show:** `client.py` scenarios (decline, flaky gateway, cancel, stuck
+  refund) drove the design one path at a time.
+- **Keep the core idea small:** enough to show durable execution and a real saga; deliberate gaps
+  are listed below.
 
-## Known limitations and next steps
+## Known limitations and future enhancements
 
-Deliberate gaps, with the Temporal feature that would close each:
-
-| Gap | Why it matters | Next step |
+| Limitation today | Why it matters | Future enhancement |
 | --- | --- | --- |
-| `NEEDS_ATTENTION` only logs `ERROR` | Nobody is paged | Alert activity (Slack/PagerDuty) before waiting for ops |
-| Status is a query, not a search attribute | Can’t list all `NEEDS_ATTENTION` in the UI | Upsert `OrderStatus` (time-skipping test server doesn’t support custom SAs) |
-| Fake services are in-worker memory | Worker kill forgets holds/charges | Real Stripe test mode / sandbox APIs |
-| Email/amount in plaintext history | Visible in the Web UI | Payload codec + codec server |
-| No workflow versioning | Changing `workflow.py` under open runs breaks replay | `workflow.patched()` or Worker Versioning |
+| A stuck undo only logs an error | Nobody is paged automatically | Alert (Slack / PagerDuty) before waiting for ops |
+| You can query one order’s status, not list all stuck ones in the UI | Ops has to know the order ID | Search attributes for status (e.g. all `NEEDS_ATTENTION`) |
+| Stand-in “Stripe” state lives in the worker process | Restarting the worker forgets demo holds/charges | Real Stripe test mode (or another sandbox) |
+| Customer email sits in workflow history in plain text | Visible to anyone with UI access | Encrypt sensitive payloads |
+| Workflow code is not versioned for live changes | Changing the flow under open orders can break replay | Workflow versioning / patched changes when promoting to production |
 
-Also next: delivery/dispute signals with durable timers, a reconciliation Schedule, Temporal Cloud.
+Also worth adding later: delivery and dispute waits with durable timers, a reconciliation job as a
+safety net, and Temporal Cloud for a shared environment.
 
-**Idempotent start:** `REJECT_DUPLICATE` on workflow ID `order-{id}` is intentional — a failed or
-completed order ID is not reused; the customer places a new order.
-
-## Troubleshooting
-
-| Symptom | Fix |
-| --- | --- |
-| `Connection refused` to `localhost:7233` | Start `temporal server start-dev` and wait until it’s healthy |
-| Worker starts then does nothing | Activate `.venv`, run from repo root, confirm task queue `orders` |
-| Non-determinism / odd replay after a pull | Restart the dev server (in-memory histories won’t match new code) |
-| `order-N already exists` | Use a new order ID (`REJECT_DUPLICATE`) |
-| Cancel rejected while shipping | Expected — too late once `SHIPPING`; operator cancel is logged and ignored |
-| `NEEDS_ATTENTION` forever | Run `python client.py resolve ORDER_ID done_manually` (or `retry`) |
-| Setup fails on Windows paths / Python version | Use 3.12+, activate the venv in **every** terminal |
+**Note:** blocking reuse of an order ID after failure or success is intentional—it avoids
+accidentally running the same charge twice. The customer places a new order instead.
