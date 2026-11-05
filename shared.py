@@ -1,4 +1,4 @@
-"""Data shared by the workflow, activities, worker and starter."""
+"""Data shared by the workflow, activities, worker and client."""
 
 from dataclasses import dataclass
 
@@ -13,7 +13,7 @@ class Order:
     amount_cents: int
     email: str
     # Failure injection for demos: "", "card_declined", "gateway_flaky",
-    # "out_of_stock", "slow_inventory", "bad_address"
+    # "out_of_stock", "slow_inventory", "bad_address", "refund_rejected"
     simulate: str = ""
 
 
