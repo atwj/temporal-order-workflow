@@ -1,9 +1,12 @@
-"""Client: places an order (starts a workflow) and waits for the result,
-or cancels an order on the customer's behalf.
+"""Client: places an order (starts a workflow) and waits for the result.
+Also cancels an order (customer), shows its status, and resolves a failed
+undo (ops).
 
 Run: python client.py ORDER_ID [SIMULATE]
-     SIMULATE = card_declined | gateway_flaky | out_of_stock | slow_inventory | bad_address
+     SIMULATE = card_declined | gateway_flaky | out_of_stock | slow_inventory | bad_address | refund_rejected
      python client.py cancel ORDER_ID
+     python client.py status ORDER_ID
+     python client.py resolve ORDER_ID retry|done_manually
 """
 
 import asyncio
@@ -18,15 +21,20 @@ from shared import TASK_QUEUE, Order
 from workflow import OrderWorkflow
 
 
-async def cancel(client: Client, order_id: str) -> None:
+async def send_update(client: Client, order_id: str, update, *args) -> None:
+    """Updates are validated by the workflow, so the reply is an immediate yes or no."""
     handle = client.get_workflow_handle(f"order-{order_id}")
     try:
-        # An Update: the workflow's validator accepts or rejects it at once.
-        print(await handle.execute_update(OrderWorkflow.cancel))
+        print(await handle.execute_update(update, *args))
     except WorkflowUpdateFailedError as err:
-        print(f"Cancel rejected: {err.cause.message}")
+        print(f"Rejected: {err.cause.message}")
     except RPCError as err:
-        print(f"Cancel rejected: {err.message}")  # order not found, or already finished
+        print(f"Rejected: {err.message}")  # order not found, or already finished
+
+
+async def status(client: Client, order_id: str) -> None:
+    handle = client.get_workflow_handle(f"order-{order_id}")
+    print(await handle.query(OrderWorkflow.get_status))
 
 
 async def place(client: Client, order_id: str, simulate: str) -> None:
@@ -61,7 +69,11 @@ async def place(client: Client, order_id: str, simulate: str) -> None:
 async def main() -> None:
     client = await Client.connect("localhost:7233")
     if sys.argv[1] == "cancel":
-        await cancel(client, sys.argv[2])
+        await send_update(client, sys.argv[2], OrderWorkflow.cancel)
+    elif sys.argv[1] == "status":
+        await status(client, sys.argv[2])
+    elif sys.argv[1] == "resolve":
+        await send_update(client, sys.argv[2], OrderWorkflow.resolve_undo, sys.argv[3])
     else:
         await place(client, sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "")
 

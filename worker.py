@@ -7,6 +7,7 @@ Run: python worker.py
 import asyncio
 import logging
 
+from temporalio import activity, workflow
 from temporalio.client import Client
 from temporalio.worker import Worker
 
@@ -24,12 +25,42 @@ from shared import TASK_QUEUE
 from workflow import OrderWorkflow
 
 
+class OrderLogFormatter(logging.Formatter):
+    """Prefixes each line with the order and step the SDK attaches to it.
+
+    activity.logger and workflow.logger add the workflow ID, activity type and
+    attempt to every record, so each line can be traced to one order.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        act = getattr(record, "temporal_activity", None)
+        wf = getattr(record, "temporal_workflow", None)
+        if act:
+            prefix = f"[{act['workflow_id']} {act['activity_type']} attempt {act['attempt']}]"
+        elif wf:
+            prefix = f"[{wf['workflow_id']} workflow]"
+        else:
+            prefix = f"[{record.name}]"
+        line = f"{record.levelname:<7} {prefix} {record.getMessage()}"
+        if record.exc_info:
+            line += "\n" + self.formatException(record.exc_info)
+        return line
+
+
+def configure_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(OrderLogFormatter())
+    logging.basicConfig(level=logging.WARNING, handlers=[handler])
+    # Activity progress is logged at INFO; everything else at WARNING and above.
+    logging.getLogger("temporalio.activity").setLevel(logging.INFO)
+    logging.getLogger("temporalio.workflow").setLevel(logging.INFO)
+    # The order and step go in the prefix, not appended to every message.
+    activity.logger.activity_info_on_message = False
+    workflow.logger.workflow_info_on_message = False
+
+
 async def main() -> None:
-    logging.basicConfig(level=logging.WARNING)
-    # The SDK logs a full stack trace for every failed activity attempt. Expected
-    # business failures (card declined, out of stock) would flood the demo log;
-    # the activities already print one clear line each.
-    logging.getLogger("temporalio.activity").setLevel(logging.ERROR)
+    configure_logging()
     client = await Client.connect("localhost:7233")
     worker = Worker(
         client,

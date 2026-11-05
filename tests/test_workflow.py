@@ -245,7 +245,7 @@ async def wait_for_call(name):
         await asyncio.sleep(0.05)
 
 
-async def test_customer_cancel_undoes_after_the_current_step(env):
+async def test_customer_cancel_after_side_effect_is_undone(env):
     world.clear()
     worker, handle = await start(env, mocks(reserve_inventory=reserve_then_wait), "c1")
     async with worker:
@@ -301,3 +301,145 @@ async def test_operator_cancel_during_capture_is_not_lost(env):
     assert isinstance(err.value.cause, CancelledError)
     assert world["charged"] and "refund_payment" in calls
     assert "ship_order" not in calls
+
+
+
+# ------------------------------------------- cancel stops the running step
+
+@activity.defn(name="reserve_inventory")
+async def reserve_until_cancelled(arg):
+    """A slow warehouse call that heartbeats, and records if it was cancelled."""
+    calls.append("reserve_inventory")
+    try:
+        while True:
+            await asyncio.sleep(0.1)
+            activity.heartbeat()
+    except asyncio.CancelledError:
+        calls.append("reserve_inventory was cancelled")
+        raise
+
+
+async def test_customer_cancel_stops_the_running_step(env):
+    worker, handle = await start(env, mocks(reserve_inventory=reserve_until_cancelled), "c7")
+    async with worker:
+        await wait_for_call("reserve_inventory")
+        await handle.execute_update(OrderWorkflow.cancel)
+        with pytest.raises(WorkflowFailureError) as err:
+            await handle.result()
+    assert err.value.cause.type == "OrderCancelled"
+    assert calls[1:] == [
+        "reserve_inventory", "reserve_inventory was cancelled",
+        "release_inventory", "void_authorization", "send_notification",
+    ]
+
+
+async def test_operator_cancel_once_shipping_is_ignored(env):
+    @activity.defn(name="ship_order")
+    async def slow_ship(arg):
+        calls.append("ship_order")
+        await asyncio.sleep(1)
+        return "track-1"
+
+    worker, handle = await start(env, mocks(ship_order=slow_ship), "c8")
+    async with worker:
+        await wait_for_call("ship_order")
+        await handle.cancel()
+        # Too late to cancel: the order completes and nothing is undone.
+        assert await handle.result() == "track-1"
+    assert "refund_payment" not in calls
+
+
+# ------------------------------------------------------ step deadline
+
+async def test_step_deadline_ends_retries_and_undoes_the_order(env):
+    # Capture fails with a transient error on every attempt. After STEP_DEADLINE
+    # (skipped in tests), the order is undone, including a refund in case an
+    # attempt charged the card.
+    @activity.defn(name="capture_payment")
+    async def gateway_down(arg):
+        calls.append("capture_payment")
+        raise RuntimeError("gateway down")
+
+    _, result = await run(env, mocks(capture_payment=gateway_down))
+    assert isinstance(result, WorkflowFailureError)
+    assert calls.count("capture_payment") > 1
+    assert calls[-4:] == [
+        "refund_payment", "release_inventory", "void_authorization", "send_notification",
+    ]
+
+
+# ------------------------------------------- undo: shield and ops hand-off
+
+async def test_operator_cancel_during_undo_does_not_stop_the_undo(env):
+    @activity.defn(name="refund_payment")
+    async def slow_refund(arg):
+        calls.append("refund_payment")
+        await asyncio.sleep(1)
+
+    acts = mocks(ship_order=mock("ship_order", fail=True), refund_payment=slow_refund)
+    worker, handle = await start(env, acts, "c9")
+    async with worker:
+        await wait_for_call("refund_payment")
+        await handle.cancel()
+        with pytest.raises(WorkflowFailureError):
+            await handle.result()
+        assert await handle.query(OrderWorkflow.get_status) == "FAILED"
+    # The refund was not interrupted (it ran once), and the release still ran.
+    assert calls.count("refund_payment") == 1
+    assert calls[-2:] == ["release_inventory", "send_notification"]
+
+
+def refund_rejected(times: int):
+    """A refund Stripe rejects the first `times` calls."""
+
+    @activity.defn(name="refund_payment")
+    async def refund(arg):
+        calls.append("refund_payment")
+        if calls.count("refund_payment") <= times:
+            raise ApplicationError("Refund rejected", type="RefundRejected", non_retryable=True)
+
+    return refund
+
+
+async def wait_for_status(handle, prefix):
+    while not (await handle.query(OrderWorkflow.get_status)).startswith(prefix):
+        await asyncio.sleep(0.05)
+
+
+async def test_failed_undo_waits_for_ops_then_continues(env):
+    acts = mocks(ship_order=mock("ship_order", fail=True), refund_payment=refund_rejected(99))
+    worker, handle = await start(env, acts, "c10")
+    async with worker:
+        await wait_for_status(handle, "NEEDS_ATTENTION")
+        assert "refund_payment" in await handle.query(OrderWorkflow.get_status)
+        # The undo does not retry forever, and the order waits: release has not run.
+        assert "release_inventory" not in calls
+        with pytest.raises(WorkflowUpdateFailedError):
+            await handle.execute_update(OrderWorkflow.resolve_undo, "ignore")
+        await handle.execute_update(OrderWorkflow.resolve_undo, "done_manually")
+        with pytest.raises(WorkflowFailureError):
+            await handle.result()
+    assert calls.count("refund_payment") == 1
+    assert calls[-2:] == ["release_inventory", "send_notification"]
+
+
+async def test_ops_can_retry_a_failed_undo(env):
+    acts = mocks(ship_order=mock("ship_order", fail=True), refund_payment=refund_rejected(1))
+    worker, handle = await start(env, acts, "c11")
+    async with worker:
+        await wait_for_status(handle, "NEEDS_ATTENTION")
+        await handle.execute_update(OrderWorkflow.resolve_undo, "retry")
+        with pytest.raises(WorkflowFailureError):
+            await handle.result()
+    assert calls.count("refund_payment") == 2  # rejected, then retried and done
+    assert calls[-2:] == ["release_inventory", "send_notification"]
+
+
+async def test_resolve_is_rejected_when_nothing_is_stuck(env):
+    worker, handle = await start(env, mocks(reserve_inventory=reserve_until_cancelled), "c12")
+    async with worker:
+        await wait_for_call("reserve_inventory")
+        with pytest.raises(WorkflowUpdateFailedError) as err:
+            await handle.execute_update(OrderWorkflow.resolve_undo, "retry")
+        assert "Nothing to resolve" in str(err.value.cause)
+        await handle.cancel()
