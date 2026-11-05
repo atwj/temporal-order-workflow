@@ -8,13 +8,14 @@ lets each test check the exact saga order: which undo steps ran, and in
 which order.
 """
 
+import asyncio
 import uuid
 
 import pytest
 from temporalio import activity
-from temporalio.client import WorkflowFailureError
+from temporalio.client import WorkflowFailureError, WorkflowUpdateFailedError
 from temporalio.common import WorkflowIDReusePolicy
-from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
+from temporalio.exceptions import ApplicationError, CancelledError, WorkflowAlreadyStartedError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
@@ -118,16 +119,18 @@ async def test_business_failure_is_not_retried(env):
 
 # ---------------------------------------------------------------- saga
 
-async def test_card_declined_has_nothing_to_undo(env):
+async def test_card_declined_voids_defensively(env):
+    # The void does nothing if no hold exists. It is there in case an earlier
+    # attempt placed a hold and then timed out.
     await run(env, mocks(authorize_payment=mock("authorize_payment", fail=True)))
-    assert calls == ["authorize_payment", "send_notification"]
+    assert calls == ["authorize_payment", "void_authorization", "send_notification"]
 
 
 async def test_out_of_stock_voids_the_authorization(env):
     await run(env, mocks(reserve_inventory=mock("reserve_inventory", fail=True)))
     assert calls == [
         "authorize_payment", "reserve_inventory",
-        "void_authorization", "send_notification",
+        "release_inventory", "void_authorization", "send_notification",
     ]
 
 
@@ -135,7 +138,9 @@ async def test_capture_failure_undoes_newest_first(env):
     await run(env, mocks(capture_payment=mock("capture_payment", fail=True)))
     assert calls == [
         "authorize_payment", "reserve_inventory", "capture_payment",
-        "release_inventory", "void_authorization", "send_notification",
+        # Refund too: the capture may have charged the card before it failed.
+        "refund_payment", "release_inventory", "void_authorization",
+        "send_notification",
     ]
 
 
@@ -200,3 +205,99 @@ async def test_real_activities_bad_address_fails_the_order(env):
     _, result = await run(env, REAL, new_order("bad_address"))
     assert isinstance(result, WorkflowFailureError)
     assert "Bad address" in str(result.cause)
+
+# ---------------------------------------------------------- cancellation
+
+world: dict = {}
+
+
+@activity.defn(name="reserve_inventory")
+async def reserve_then_wait(arg):
+    """The warehouse reserves at once, then the reply is slow. Heartbeats."""
+    calls.append("reserve_inventory")
+    world["reserved"] = True
+    for _ in range(30):
+        await asyncio.sleep(0.1)
+        activity.heartbeat()
+    return "res-1"
+
+
+@activity.defn(name="capture_payment")
+async def capture_slow_reply(arg):
+    """Stripe charges at once, then the reply is slow. No heartbeat."""
+    calls.append("capture_payment")
+    world["charged"] = True
+    await asyncio.sleep(1)
+    return "charge-1"
+
+
+async def start(env, acts, queue):
+    order = new_order()
+    worker = Worker(env.client, task_queue=queue, workflows=[OrderWorkflow], activities=acts)
+    handle = await env.client.start_workflow(
+        OrderWorkflow.run, order, id=f"order-{order.order_id}", task_queue=queue
+    )
+    return worker, handle
+
+
+async def wait_for_call(name):
+    while name not in calls:
+        await asyncio.sleep(0.05)
+
+
+async def test_customer_cancel_undoes_after_the_current_step(env):
+    world.clear()
+    worker, handle = await start(env, mocks(reserve_inventory=reserve_then_wait), "c1")
+    async with worker:
+        await wait_for_call("reserve_inventory")
+        assert "accepted" in await handle.execute_update(OrderWorkflow.cancel)
+        with pytest.raises(WorkflowFailureError) as err:
+            await handle.result()
+    assert err.value.cause.type == "OrderCancelled"
+    # The reservation went through, so it is released.
+    assert calls[-3:] == ["release_inventory", "void_authorization", "send_notification"]
+    assert "capture_payment" not in calls
+
+
+async def test_customer_cancel_is_rejected_once_shipping(env):
+    @activity.defn(name="ship_order")
+    async def slow_ship(arg):
+        calls.append("ship_order")
+        await asyncio.sleep(1)
+        return "track-1"
+
+    worker, handle = await start(env, mocks(ship_order=slow_ship), "c2")
+    async with worker:
+        await wait_for_call("ship_order")
+        with pytest.raises(WorkflowUpdateFailedError) as err:
+            await handle.execute_update(OrderWorkflow.cancel)
+        assert "Too late to cancel" in str(err.value.cause)
+        assert await handle.result() == "track-1"
+
+
+async def test_operator_cancel_after_side_effect_is_still_undone(env):
+    # The heartbeat delivers the cancel, but the stock was already reserved.
+    world.clear()
+    worker, handle = await start(env, mocks(reserve_inventory=reserve_then_wait), "c3")
+    async with worker:
+        await wait_for_call("reserve_inventory")
+        await handle.cancel()
+        with pytest.raises(WorkflowFailureError) as err:
+            await handle.result()
+    assert isinstance(err.value.cause, CancelledError)
+    assert world["reserved"] and "release_inventory" in calls
+
+
+async def test_operator_cancel_during_capture_is_not_lost(env):
+    # Capture finishes after the cancel. The order must not ship, and the
+    # charge must be refunded.
+    world.clear()
+    worker, handle = await start(env, mocks(capture_payment=capture_slow_reply), "c4")
+    async with worker:
+        await wait_for_call("capture_payment")
+        await handle.cancel()
+        with pytest.raises(WorkflowFailureError) as err:
+            await handle.result()
+    assert isinstance(err.value.cause, CancelledError)
+    assert world["charged"] and "refund_payment" in calls
+    assert "ship_order" not in calls

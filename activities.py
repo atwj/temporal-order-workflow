@@ -38,8 +38,9 @@ async def authorize_payment(order: Order) -> str:
 
 
 @activity.defn
-async def void_authorization(auth_id: str) -> None:
-    log(f"voided {auth_id}")
+async def void_authorization(order: Order) -> None:
+    # Idempotent: void the hold for this order if there is one; else do nothing.
+    log(f"voided auth-{order.order_id}")
 
 
 @activity.defn
@@ -50,8 +51,9 @@ async def capture_payment(order: Order) -> str:
 
 
 @activity.defn
-async def refund_payment(charge_id: str) -> None:
-    log(f"refunded {charge_id}")
+async def refund_payment(order: Order) -> None:
+    # Idempotent: refund the charge for this order if there is one; else do nothing.
+    log(f"refunded charge-{order.order_id}")
 
 
 # ---------------------------------------------------------- inventory
@@ -62,15 +64,20 @@ async def reserve_inventory(order: Order) -> str:
         log(f"{order.item} out of stock")
         raise ApplicationError("Out of stock", type="OutOfStock", non_retryable=True)
     if order.simulate == "slow_inventory":
-        log("warehouse is slow: kill the worker now to test recovery")
-        await asyncio.sleep(10)
+        log("warehouse is slow: kill the worker or cancel the order now")
+        for _ in range(10):
+            await asyncio.sleep(1)
+            # Heartbeat: tells Temporal this worker is alive, and is how the
+            # activity learns it was cancelled (the sleep then raises CancelledError).
+            activity.heartbeat()
     log(f"reserved {order.quantity} x {order.item}")
     return f"res-{order.order_id}"
 
 
 @activity.defn
-async def release_inventory(reservation_id: str) -> None:
-    log(f"released {reservation_id}")
+async def release_inventory(order: Order) -> None:
+    # Idempotent: release this order's reservation if there is one; else do nothing.
+    log(f"released res-{order.order_id}")
 
 
 # ----------------------------------------------------------- shipping
