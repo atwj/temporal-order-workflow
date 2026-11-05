@@ -92,7 +92,7 @@ Use a **new order ID** for each run (reuse is rejected on purpose).
 | 8 | Customer cancel | `python client.py 8 slow_inventory`, then `python client.py cancel 8` | Reserve **stopped**; void auth; `CANCELLED` |
 | 9 | Operator cancel | Same as 8, but `temporal workflow cancel --workflow-id order-9` | Same cleanup; Web UI status **Canceled** |
 | 10 | Cancel too late | `python client.py cancel 1` | `Rejected: workflow execution already completed`. Mid-ship: `Too late to cancel` |
-| 11 | Refund refused | `python client.py 11 refund_rejected`, then `status 11`, then `resolve 11 done_manually` | `NEEDS_ATTENTION` → after resolve, release runs → FAILED |
+| 11 | Refund refused | `python client.py 11 refund_rejected`, then `status 11`, then `resolve 11 done_manually` | Ship fails first (**Bad address**), then the refund undo is refused → `NEEDS_ATTENTION`. After `resolve`, release runs; client still ends `FAILED: Order failed: Bad address` (the original ship error, not the refund) |
 
 While order 6 runs:
 
@@ -109,7 +109,7 @@ Worker log lines look like `[order-4 void_authorization attempt 1]` (`activity.l
 - **4:** `no reservation to release for order 4`, then `voided auth-4`
 - **8/9:** warehouse “slow” line, **no** `reserved` line, then void
 - **10 (shipping):** `Cancel ignored: the order has already shipped`
-- **11:** `ERROR` … `refund_payment failed`, later `released res-11`
+- **11:** carrier rejected (Bad address) → `Stripe rejected the refund` → `ERROR` … `refund_payment failed` → after resolve, `released res-11`
 
 ## How the saga works
 
