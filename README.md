@@ -8,9 +8,6 @@ If a step fails, or the customer cancels before shipping, the completed steps ar
 reverse order. If an undo cannot complete (for example, Stripe refuses a refund), the order
 pauses until an operator decides what to do.
 
-Submission for the Temporal SA technical exercise, e-commerce order use case. Built with the
-Temporal Python SDK. Stripe, inventory, the carrier and email are mocked in `fake_services.py`.
-
 Quick start (full setup in [section 6](#6-run-the-demo)):
 
 ```bash
@@ -49,11 +46,7 @@ crashed worker resumes where it stopped instead of starting over.
 | Compensation handlers in each service | One compensation list in the workflow |
 | Worker health checks | Heartbeat timeouts, then retry on another worker |
 
-Still the application's responsibility:
-
-- Idempotency keys on external APIs. Temporal runs activities at least once, so a retried
-  call must not charge twice.
-- A reconciliation job as a safety net. It is not the primary recovery path.
+However, ensuring idempotency in activities is still a repsonsibility that belongs to the application since Temporal runs activities at least once.
 
 ## 3. How the order works
 
@@ -116,17 +109,20 @@ There are two ways to cancel:
 
 ## 5. Approach
 
-- Use case: the e-commerce order from the exercise brief. <!-- TODO: one sentence on why you picked it, e.g. link to your Stripe payments experience -->
-- Scope: payment authorize/capture, inventory, shipping and notification after an order is
-  placed. Basket, pricing and checkout UI are out of scope.
-- Mocks: external services are in-memory stand-ins that honour idempotency keys and
-  treat an undo with nothing to undo as a success, so failure behaviour is realistic
-  without live integrations.
-- Process: built the happy path first, then added one failure scenario at a time (the
-  `SIMULATE` options). The first version handled cancel with hand-written checks; it was
-  then reworked to use Temporal primitives (updates with validators, activity cancellation
-  types, `schedule_to_close_timeout`, ID reuse policy).
-- Tests: 29 tests in `tests/` using the Temporal test environment; no server needed.
+- I started from the e-commerce use case in the exercise brief and worked out what has to
+  happen after the customer pays: authorizing and capturing the payment, reserving stock,
+  shipping and notifying the customer.
+- The external services are simple in-memory mocks in `fake_services.py`. Like the real
+  services, they honour idempotency keys and treat an undo with nothing to undo as a
+  success. That keeps the failure behaviour realistic without live integrations.
+- I built the happy path first, then added one failure scenario at a time (the `SIMULATE`
+  options). My first version handled cancel with hand-written checks. I then reworked it to
+  use Temporal primitives: updates with validators, activity cancellation types,
+  `schedule_to_close_timeout` and the ID reuse policy.
+- A small command-line client (`client.py`) let me start, cancel, query and resolve orders
+  from the terminal while testing each scenario.
+- I wrote 29 tests in `tests/` using the Temporal test environment. The workflow tests use
+  time skipping, so they run in seconds without a server.
 
 ## 6. Run the demo
 
